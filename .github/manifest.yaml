@@ -34,4 +34,12 @@ ci:
         depends_on: [app]
   state:
     prod: {}
-    staging: {}
+    staging:
+      sha: 1b8ad575940093f57b7c2a0be62b6992b157ea2e
+      version: v0.1.0-rc.0
+      committed_at: "2026-07-20T05:02:53Z"
+      committed_by: joshua-temple
+      builds:
+        build:
+          sha: 1b8ad575940093f57b7c2a0be62b6992b157ea2e
+          artifact_id: app-1b8ad575940093f57b7c2a0be62b6992b157ea2e
