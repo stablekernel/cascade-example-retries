@@ -1,0 +1,80 @@
+name: deploy-app
+
+# Environment deploy callee that fails on its first attempt and succeeds on the
+# retry. The fail-once marker is an Actions cache entry keyed by the run id and
+# the target environment, so it is unique to a single run and a single
+# environment and resets automatically: a fresh run always starts with a cache
+# miss (no marker), so the first attempt fails; the retry shim re-invokes this
+# same callee, finds the marker the first attempt left behind, and succeeds.
+# Because the key is scoped to github.run_id, no state carries between runs, so
+# the marker can never wedge a later run into a stuck state.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        type: string
+      sha:
+        required: false
+        type: string
+      version:
+        required: false
+        type: string
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dry run preview
+        if: ${{ inputs.dry_run }}
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          echo "deploy-app dry run for environment=${ENVIRONMENT}; no marker touched"
+
+      - name: Probe fail-once marker
+        id: probe
+        if: ${{ !inputs.dry_run }}
+        uses: actions/cache/restore@v4
+        with:
+          path: retry-marker
+          key: deploy-app-attempted-${{ github.run_id }}-${{ inputs.environment }}
+          lookup-only: true
+
+      - name: Report attempt
+        if: ${{ !inputs.dry_run }}
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+          HIT: ${{ steps.probe.outputs.cache-hit }}
+        run: |
+          echo "deploy-app environment=${ENVIRONMENT} sha=${SHA} marker_present=${HIT}"
+
+      - name: Retry attempt succeeds
+        if: ${{ !inputs.dry_run && steps.probe.outputs.cache-hit == 'true' }}
+        run: |
+          echo "marker present, this is the retry attempt; deploy succeeds"
+
+      - name: Arm the fail-once marker
+        if: ${{ !inputs.dry_run && steps.probe.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p retry-marker
+          date -u +%FT%TZ > retry-marker/attempted
+
+      - name: Persist the fail-once marker
+        if: ${{ !inputs.dry_run && steps.probe.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: retry-marker
+          key: deploy-app-attempted-${{ github.run_id }}-${{ inputs.environment }}
+
+      - name: First attempt fails
+        if: ${{ !inputs.dry_run && steps.probe.outputs.cache-hit != 'true' }}
+        run: |
+          echo "marker absent, this is the first attempt; failing so the retry shim can rescue it"
+          exit 1

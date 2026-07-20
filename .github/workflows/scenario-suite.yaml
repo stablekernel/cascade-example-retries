@@ -1,0 +1,281 @@
+name: scenario-suite
+
+# Proves, on real GitHub, that a deploy which fails on its first attempt and
+# succeeds on its retry leaves the environment DEPLOYED and the run GREEN, and
+# that a dependent deploy gated on the retried deploy still RUNS.
+#
+# The generator emits a retry shim job (Deploy (app) - Retry 1) that re-invokes
+# the deploy callee when the base attempt fails. Downstream jobs must key on the
+# effective result of the deploy (the base OR any retry succeeded), not on the
+# immutable result of the base attempt. Two things only real GitHub can show:
+#   1. the base attempt concludes failure, the retry concludes success, the
+#      environment's deployed sha advances, and the run is green; and
+#   2. the dependent deploy (notify) runs rather than being skipped, because its
+#      gate reads the effective result of the retried base deploy.
+#
+# The suite never runs the lifecycle inline. It merges a source change, which
+# fires the generated orchestrate workflow, then reads the run's job conclusions
+# and the committed deploy state. Every run it causes is registered into the
+# fleet ledger; the final reconcile job fails closed on any unregistered run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cascade_version:
+        description: 'cascade rc tag to self-repin to (e.g. v0.16.4-rc.0). Empty runs committed defaults.'
+        required: false
+        default: ''
+      cascade_version_sha:
+        description: 'Peeled commit SHA paired with cascade_version. Empty runs committed defaults.'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 6 * * 3'
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: scenario-suite
+  cancel-in-progress: false
+
+env:
+  MANIFEST: .github/manifest.yaml
+  MANIFEST_KEY: ci
+
+jobs:
+  open-window:
+    name: Open reconcile window
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      window-start: ${{ steps.window.outputs.window-start }}
+    steps:
+      # The reconcile window opens before the merge, so every run the suite
+      # causes lands at or after this timestamp and the reconcile job sees it.
+      - name: Open reconcile window
+        id: window
+        run: |
+          set -euo pipefail
+          WINDOW_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "window-start=$WINDOW_START" >> "$GITHUB_OUTPUT"
+          echo "reconcile window opened at $WINDOW_START"
+
+  lifecycle:
+    name: Retry-rescued deploy plus dependent deploy
+    needs: [open-window]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+      TRUNK: main
+    outputs:
+      run_id: ${{ steps.orchestrate.outputs.run_id }}
+    steps:
+      - name: Install gh transient-retry wrapper
+        run: |
+          cat > "$RUNNER_TEMP/gh-retry.sh" <<'GHRETRY'
+          _gh_is_transient() {
+            local out="$1"
+            if printf '%s' "$out" | grep -qiE 'HTTP 5[0-9][0-9]|HTTP 429|HTTP 401|Bad credentials|was submitted too quickly|secondary rate limit'; then
+              return 0
+            fi
+            if printf '%s' "$out" | grep -qiE 'HTTP 403'; then
+              if printf '%s' "$out" | grep -qiE 'rate limit|secondary|abuse|too quickly'; then
+                return 0
+              fi
+            fi
+            return 1
+          }
+          gh() {
+            local attempt=1 max="${GH_RETRY_MAX:-5}" delay="${GH_RETRY_BASE_DELAY:-3}" out rc
+            while :; do
+              out="$(command gh "$@" 2>&1)" && rc=0 || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                printf '%s\n' "$out"
+                return 0
+              fi
+              if [ "$attempt" -ge "$max" ] || ! _gh_is_transient "$out"; then
+                printf '%s\n' "$out" >&2
+                return "$rc"
+              fi
+              printf 'gh: transient error on attempt %d/%d, retrying in %ds\n%s\n' "$attempt" "$max" "$delay" "$out" >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+          GHRETRY
+          echo "BASH_ENV=$RUNNER_TEMP/gh-retry.sh" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up cascade CLI
+        uses: stablekernel/cascade/.github/actions/setup-cli@v0.16.5
+        with:
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+          version: ${{ inputs.cascade_version || 'v0.16.5' }}
+
+      - name: Log cascade version mode
+        run: |
+          if [ -n "${{ inputs.cascade_version }}" ]; then
+            echo "Running against dispatched rc: ${{ inputs.cascade_version }} (sha ${{ inputs.cascade_version_sha }})"
+          else
+            echo "Running against committed defaults (no rc dispatched)"
+          fi
+
+      - name: Self-repin manifest to the dispatched rc
+        uses: stablekernel/cascade/.github/actions/fleet-repin@main
+        with:
+          cascade_version: ${{ inputs.cascade_version }}
+          cascade_version_sha: ${{ inputs.cascade_version_sha }}
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+
+      - name: Clean slate - delete leftover releases and tags
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+            | while read -r t; do gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true; done
+          git fetch --tags --quiet || true
+          for t in $(git tag -l 'v*' 'rel-*'); do git push origin --delete "$t" 2>/dev/null || true; done
+
+      - name: Record the prior staging deploy sha
+        id: prior
+        run: |
+          set -euo pipefail
+          git fetch origin "$TRUNK" --quiet
+          git checkout "origin/$TRUNK" -- "$MANIFEST" || true
+          PRIOR="$(cascade status env staging --json | jq -r '.state.deploys.app.sha // empty')"
+          echo "prior_sha=$PRIOR" >> "$GITHUB_OUTPUT"
+          echo "prior staging app deploy sha: '${PRIOR:-<none>}'"
+
+      - name: Open and merge a source change
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="scenario/src-$(date +%s)"
+          git checkout -b "$BRANCH"
+          mkdir -p src
+          echo "touched at $(date -u +%FT%TZ)" >> src/scenario.txt
+          git add src/scenario.txt
+          git commit --no-gpg-sign -m "feat: scenario source change"
+          git push origin "$BRANCH"
+          PR_URL="$(gh pr create --base "$TRUNK" --head "$BRANCH" \
+            --title "feat: scenario source change" \
+            --body "Automated scenario run. Drives orchestrate on merge.")"
+          echo "Opened $PR_URL"
+          gh pr merge "$BRANCH" --rebase --delete-branch
+          git fetch origin "$TRUNK" --quiet
+          MERGE_SHA="$(git rev-parse "origin/$TRUNK")"
+          echo "merge_sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+          echo "merged as $MERGE_SHA"
+
+      - name: Wait for the orchestrate run on the merge sha
+        id: orchestrate
+        env:
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+        run: |
+          set -euo pipefail
+          RUN_ID=""
+          for i in $(seq 1 6); do
+            RUN_ID="$(gh run list --workflow=orchestrate.yaml --branch=main \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha==\"$MERGE_SHA\") | .databaseId" | head -n1 || true)"
+            [ -n "$RUN_ID" ] && break
+            echo "attempt $i: no orchestrate run for $MERGE_SHA yet"
+            sleep 60
+          done
+          [ -n "$RUN_ID" ] || { echo "::error::no orchestrate run found for $MERGE_SHA"; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          # The base deploy fails once and the retry rescues it, so the run must
+          # still conclude success. --exit-status asserts the green run.
+          gh run watch "$RUN_ID" --exit-status --interval 60
+
+      - name: Register orchestrate run
+        uses: stablekernel/cascade/.github/actions/register-run@main
+        with:
+          run-id: ${{ steps.orchestrate.outputs.run_id }}
+          expected-conclusion: success
+          reason: retry-rescued-deploy-and-dependent
+          upload: 'true'
+
+      - name: Assert retry rescue, advanced deploy state, and dependent ran
+        env:
+          RUN_ID: ${{ steps.orchestrate.outputs.run_id }}
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+          PRIOR_SHA: ${{ steps.prior.outputs.prior_sha }}
+        run: |
+          set -euo pipefail
+          JOBS_JSON="$(gh run view "$RUN_ID" --json jobs,conclusion)"
+          fail=0
+
+          conclusion_of() {
+            echo "$JOBS_JSON" | jq -r --arg n "$1" \
+              '[.jobs[] | select(.name | startswith($n))] | (.[0].conclusion // "missing")'
+          }
+          assert() {
+            local label="$1" got="$2" want="$3"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$label was '$got', expected '$want'"; fail=1
+            else
+              echo "OK: $label is '$got'"
+            fi
+          }
+
+          # 1. The base deploy failed once and the retry shim rescued it.
+          assert "base Deploy (app) conclusion" "$(conclusion_of 'Deploy (app) - Retry 1')" success
+          BASE="$(echo "$JOBS_JSON" | jq -r '[.jobs[] | select((.name | startswith("Deploy (app)")) and (.name | contains("Retry") | not))] | (.[0].conclusion // "missing")')"
+          assert "first Deploy (app) attempt failed" "$BASE" failure
+
+          # 2. The dependent deploy ran (was not skipped) despite the base
+          #    attempt failing, proving the effective-result dependency gate.
+          NOTIFY="$(conclusion_of 'Deploy (notify)')"
+          assert "dependent Deploy (notify) ran" "$NOTIFY" success
+
+          # 3. The overall orchestrate run is green.
+          assert "orchestrate run conclusion" "$(echo "$JOBS_JSON" | jq -r '.conclusion')" success
+
+          # 4. The environment's deployed sha advanced to the merge sha.
+          git fetch origin "$TRUNK" --quiet
+          NEW_SHA=""
+          for i in $(seq 1 10); do
+            git checkout "origin/$TRUNK" -- "$MANIFEST" || true
+            NEW_SHA="$(cascade status env staging --json | jq -r '.state.deploys.app.sha // empty')"
+            [ -n "$NEW_SHA" ] && [ "$NEW_SHA" != "$PRIOR_SHA" ] && break
+            echo "attempt $i: staging deploy sha not advanced yet (have '${NEW_SHA:-<none>}')"
+            sleep 30
+            git fetch origin "$TRUNK" --quiet
+          done
+          assert "staging app deploy sha advanced to merge sha" "$NEW_SHA" "$MERGE_SHA"
+
+          {
+            echo "## Retry-rescued deploy and dependent gate"
+            echo "- first Deploy (app) attempt: $BASE"
+            echo "- Deploy (app) - Retry 1: $(conclusion_of 'Deploy (app) - Retry 1')"
+            echo "- dependent Deploy (notify): $NOTIFY"
+            echo "- staging app deploy sha: $NEW_SHA (merge sha $MERGE_SHA)"
+            echo "- orchestrate run conclusion: $(echo "$JOBS_JSON" | jq -r '.conclusion')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$fail" -eq 0 ] || { echo "::error::one or more retry-rescue assertions failed"; exit 1; }
+
+  # Reconcile gate: enumerates every run this repo produced since window-start
+  # and fails closed if any is unregistered or concluded other than its
+  # registered expectation.
+  reconcile:
+    name: Reconcile scenario-window runs
+    needs: [open-window, lifecycle]
+    if: always()
+    uses: stablekernel/cascade/.github/workflows/fleet-reconcile.yaml@main
+    permissions:
+      contents: read
+      actions: read
+    with:
+      window-start: ${{ needs.open-window.outputs.window-start }}
+      cascade-ref: main

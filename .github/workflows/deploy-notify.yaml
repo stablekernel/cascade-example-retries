@@ -1,0 +1,34 @@
+name: deploy-notify
+
+# Dependent deploy callee. It depends_on the app deploy, which is rescued by a
+# retry after its first attempt fails. This callee must RUN, proving the
+# dependency gate reads the effective result of app (base OR any retry
+# succeeded), not the immutable result of app's failed first attempt.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        type: string
+      sha:
+        required: false
+        type: string
+      version:
+        required: false
+        type: string
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          echo "deploy-notify ran for environment=${ENVIRONMENT} sha=${SHA}; the app dependency was rescued by its retry, so this dependent deploy was reached"
