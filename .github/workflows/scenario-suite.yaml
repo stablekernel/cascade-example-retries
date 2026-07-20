@@ -1,17 +1,24 @@
 name: scenario-suite
 
 # Proves, on real GitHub, that a deploy which fails on its first attempt and
-# succeeds on its retry leaves the environment DEPLOYED and the run GREEN, and
-# that a dependent deploy gated on the retried deploy still RUNS.
+# succeeds on its retry leaves the environment DEPLOYED, and that a dependent
+# deploy gated on the retried deploy still RUNS.
 #
 # The generator emits a retry shim job (Deploy (app) - Retry 1) that re-invokes
 # the deploy callee when the base attempt fails. Downstream jobs must key on the
 # effective result of the deploy (the base OR any retry succeeded), not on the
-# immutable result of the base attempt. Two things only real GitHub can show:
-#   1. the base attempt concludes failure, the retry concludes success, the
-#      environment's deployed sha advances, and the run is green; and
+# immutable result of the base attempt. The rescue is proven by JOB RESULTS and
+# committed state, not by the run's aggregate conclusion: cascade deliberately
+# never emits continue-on-error on reusable-workflow caller jobs, so a run whose
+# base Deploy (app) job failed concludes failure even when the retry rescues the
+# deploy. That red aggregate conclusion is by design. Three things only real
+# GitHub can show:
+#   1. the base attempt concludes failure, the retry concludes success, and the
+#      environment's deployed sha advances;
 #   2. the dependent deploy (notify) runs rather than being skipped, because its
-#      gate reads the effective result of the retried base deploy.
+#      gate reads the effective result of the retried base deploy; and
+#   3. the run's aggregate conclusion is failure, confirming the caller job
+#      carries no continue-on-error even though the deploy was rescued.
 #
 # The suite never runs the lifecycle inline. It merges a source change, which
 # fires the generated orchestrate workflow, then reads the run's job conclusions
@@ -193,15 +200,18 @@ jobs:
           done
           [ -n "$RUN_ID" ] || { echo "::error::no orchestrate run found for $MERGE_SHA"; exit 1; }
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          # The base deploy fails once and the retry rescues it, so the run must
-          # still conclude success. --exit-status asserts the green run.
-          gh run watch "$RUN_ID" --exit-status --interval 60
+          # The base deploy fails once and the retry rescues it. The run is red
+          # by design on the rescued base (cascade emits no continue-on-error on
+          # caller jobs), so wait for completion WITHOUT --exit-status; the
+          # rescue is proven below by job results and committed state, not by the
+          # run's aggregate conclusion.
+          gh run watch "$RUN_ID" --interval 60
 
       - name: Register orchestrate run
         uses: stablekernel/cascade/.github/actions/register-run@main
         with:
           run-id: ${{ steps.orchestrate.outputs.run_id }}
-          expected-conclusion: success
+          expected-conclusion: failure
           reason: retry-rescued-deploy-and-dependent
           upload: 'true'
 
@@ -238,8 +248,12 @@ jobs:
           NOTIFY="$(conclusion_of 'Deploy (notify)')"
           assert "dependent Deploy (notify) ran" "$NOTIFY" success
 
-          # 3. The overall orchestrate run is green.
-          assert "orchestrate run conclusion" "$(echo "$JOBS_JSON" | jq -r '.conclusion')" success
+          # 3. The overall orchestrate run concludes failure by design: cascade
+          #    emits no continue-on-error on caller jobs, so the failed base
+          #    Deploy (app) job reds the aggregate conclusion even though the
+          #    retry rescued the deploy. The rescue itself is proven by
+          #    assertions 1, 2, and 4 (retry ran, dependent ran, state advanced).
+          assert "orchestrate run conclusion" "$(echo "$JOBS_JSON" | jq -r '.conclusion')" failure
 
           # 4. The environment's deployed sha advanced to the merge sha.
           git fetch origin "$TRUNK" --quiet
