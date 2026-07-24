@@ -123,7 +123,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up cascade CLI
-        uses: stablekernel/cascade/.github/actions/setup-cli@v1.1.1
+        uses: stablekernel/cascade/.github/actions/setup-cli@v1.1.2
         with:
           token: ${{ secrets.CASCADE_STATE_TOKEN }}
           version: ${{ inputs.cascade_version || 'v0.16.5' }}
