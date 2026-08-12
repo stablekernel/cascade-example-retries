@@ -35,20 +35,20 @@ ci:
   state:
     prod: {}
     staging:
-      sha: 7ccfd3e83df35f41afd296eee7598c8f2fd784cc
-      version: v0.1.0-rc.2
-      committed_at: "2026-08-05T06:50:24Z"
+      sha: 25f238e18cd50c6e87777b4b9d3e1442ea378775
+      version: v0.1.0-rc.3
+      committed_at: "2026-08-12T06:27:13Z"
       committed_by: joshua-temple
       builds:
         build:
-          sha: 7ccfd3e83df35f41afd296eee7598c8f2fd784cc
-          artifact_id: app-7ccfd3e83df35f41afd296eee7598c8f2fd784cc
+          sha: 25f238e18cd50c6e87777b4b9d3e1442ea378775
+          artifact_id: app-25f238e18cd50c6e87777b4b9d3e1442ea378775
       deploys:
         app:
-          sha: 7ccfd3e83df35f41afd296eee7598c8f2fd784cc
-          deployed_at: "2026-08-05T06:50:24Z"
+          sha: 25f238e18cd50c6e87777b4b9d3e1442ea378775
+          deployed_at: "2026-08-12T06:27:13Z"
           deployed_by: joshua-temple
         notify:
-          sha: 7ccfd3e83df35f41afd296eee7598c8f2fd784cc
-          deployed_at: "2026-08-05T06:50:24Z"
+          sha: 25f238e18cd50c6e87777b4b9d3e1442ea378775
+          deployed_at: "2026-08-12T06:27:13Z"
           deployed_by: joshua-temple
